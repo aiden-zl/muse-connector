@@ -7,7 +7,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import { jobKeys, softKey } from "../src/keys.ts";
-import { classify } from "./eligibility.mjs";
+import { classify, usOk } from "./eligibility.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const args = Object.fromEntries(
@@ -15,6 +15,9 @@ const args = Object.fromEntries(
 );
 const LIMIT = Number(args.limit ?? 300);
 const INCLUDE_NON_US = process.argv.includes("--include-non-us");
+const NO_WORKDAY = process.argv.includes("--no-workday");
+const ONLY_WORKDAY = process.argv.includes("--only-workday");
+const WORKDAY_BUDGET_MS = 60_000;
 const companies = JSON.parse(readFileSync(args.companies ?? join(here, "companies.json"), "utf8"));
 const batchesDir = join(here, "..", "batches");
 const OUT = args.out ?? nextBatchName();
@@ -25,8 +28,8 @@ function nextBatchName() {
 }
 
 const TITLE_INTERN = /\b(intern|interns|internship|co-?op|summer analyst|summer associate)\b/i;
-const TITLE_FIELD = /\b(software|engineer|engineering|developer|swe|quant|quantitative|trading|trader|research|data|machine learning|ml|ai|infrastructure|backend|back-end|frontend|front-end|full[- ]stack|platform|security|systems|mobile|ios|android|devops|sre|algorithm)/i;
-const TITLE_EXCLUDE = /\b(electrical|mechanical|civil|chemical|manufacturing|hardware|asic|rtl|analog|rf|process engineer|industrial|supply chain|facilities|construction|environmental|biomedical|clinical|phd|ph\.d|doctoral|mba|master'?s|postdoc|new grad|full[- ]time|senior|staff|principal|manager|director|recruit|sales|marketing|legal|finance intern|accounting|hr |people|design intern|summer 2026|fall 2026|2026 intern)\b/i;
+const TITLE_FIELD = /\b(software|swe|sde|developer|quant|quantitative|trading|trader|machine learning|ml|ai|data scien\w*|data engineer\w*|data analy\w*|backend|back-end|frontend|front-end|full[- ]?stack|infrastructure|platform engineer\w*|security engineer\w*|mobile|ios|android|devops|sre|site reliability|algorithm\w*|computer science|research engineer\w*|production engineer\w*|cloud|technology analyst|technologist)\b/i;
+const TITLE_EXCLUDE = /\b(high school|(winter|fall|autumn|spring) 20\d\d|electrical|mechanical|civil|chemical|manufacturing|hardware|asic|rtl|analog|rf|process engineer|industrial|supply chain|facilities|construction|environmental|biomedical|clinical|phd|ph\.d|doctoral|mba|master'?s|postdoc|new grad|full[- ]time|senior|staff|principal|manager|director|recruit|sales|marketing|legal|finance intern|accounting|hr |people|design intern|summer 2026|fall 2026|2026 intern)\b/i;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -110,6 +113,7 @@ async function workday(spec) {
   const base = `https://${tenant}.${wd}.myworkdayjobs.com`;
   const api = `${base}/wday/cxs/${tenant}/${site}`;
   const seen = new Map();
+  const deadline = Date.now() + WORKDAY_BUDGET_MS;
   for (let offset = 0; offset < 200; offset += 20) {
     const d = await postJson(`${api}/jobs`, { appliedFacets: {}, limit: 20, offset, searchText: "intern" });
     if (!d) { if (offset === 0) return null; break; }
@@ -119,6 +123,7 @@ async function workday(spec) {
   }
   const out = [];
   for (const j of seen.values()) {
+    if (Date.now() > deadline) break;
     if (!TITLE_INTERN.test(j.title) || !TITLE_FIELD.test(j.title) || TITLE_EXCLUDE.test(j.title)) continue;
     await sleep(300);
     const det = await getJsonRetry(`${api}${j.externalPath}`);
@@ -132,14 +137,6 @@ async function workday(spec) {
     });
   }
   return out;
-}
-
-const NON_US = /\b(china|shanghai|beijing|shenzhen|hong kong|taiwan|taipei|india|bangalore|bengaluru|hyderabad|pune|chennai|mumbai|delhi|gurgaon|noida|poland|gdansk|krakow|warsaw|united kingdom|uk|england|london|cambridge, uk|edinburgh|ireland|dublin|germany|berlin|munich|netherlands|amsterdam|france|paris|spain|madrid|barcelona|switzerland|zurich|geneva|singapore|japan|tokyo|korea|seoul|australia|sydney|melbourne|canada|toronto|vancouver|montreal|ontario|quebec|israel|tel aviv|brazil|sao paulo|mexico|romania|czech|prague|hungary|budapest|sweden|stockholm|denmark|copenhagen|finland|norway|italy|milan|portugal|lisbon|uae|dubai|vietnam|philippines|malaysia|costa rica|argentina|colombia|chile)\b/i;
-const US = /\b(united states|usa|u\.s\.|us|remote|new york|nyc|san francisco|seattle|chicago|boston|austin|los angeles|denver|atlanta|miami|dallas|houston|philadelphia|pittsburgh|washington|mclean|santa clara|san jose|mountain view|palo alto|menlo park|sunnyvale|redmond|bellevue|cambridge, ma|[A-Z]{2}\b)/;
-function usOk(loc) {
-  if (!loc || /\d+ locations?/i.test(loc)) return true;
-  if (US.test(loc)) return true;
-  return !NON_US.test(loc);
 }
 
 const prettyCompany = (s) => (/[A-Z ]/.test(s) ? s : s.replace(/(^|-)([a-z])/g, (_, a, b) => (a ? " " : "") + b.toUpperCase()));
@@ -170,12 +167,12 @@ const csvCell = (v) => {
 
 async function main() {
   const known = knownKeys();
-  const sources = [
+  const sources = ONLY_WORKDAY ? [] : [
     ...companies.greenhouse.map((t) => ["greenhouse", t, greenhouse]),
     ...companies.lever.map((t) => ["lever", t, lever]),
     ...companies.ashby.map((t) => ["ashby", t, ashby]),
   ];
-  const wdSources = (companies.workday ?? []).map((t) => ["workday", t, workday]);
+  const wdSources = NO_WORKDAY ? [] : (companies.workday ?? []).map((t) => ["workday", t, workday]);
   const missing = [];
   const candidates = [];
   const stats = { boards_ok: 0, postings: 0, intern_titles: 0, excluded_grad_year: 0, duplicates: 0 };

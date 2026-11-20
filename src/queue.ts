@@ -449,7 +449,7 @@ export async function askGuardian(
   if (!JOB_SPECIFIC_KINDS.has(kind)) {
     // cross-job dedupe: an identical question already answered → return the answer right away
     const prior = await db
-      .prepare(`SELECT id, status, answer FROM questions WHERE norm = ? AND kind = ? AND status IN ('open','answered') ORDER BY id DESC LIMIT 1`)
+      .prepare(`SELECT id, status, answer FROM questions WHERE norm = ? AND kind = ? AND job_only = 0 AND status IN ('open','answered') ORDER BY id DESC LIMIT 1`)
       .bind(norm, kind)
       .first<{ id: number; status: string; answer: string | null }>();
     if (prior?.status === "answered" && prior.answer != null) {

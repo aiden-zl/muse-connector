@@ -446,24 +446,63 @@ async function main() {
     assert.equal(d2.status, "needs_human");
     await admin("POST", "/admin/config", { max_defers: "5" });
   });
-  await test("soft-key sibling is never leased while its twin is held; flagged when twin submits", async () => {
+  await test("soft-key twins: flagged at push; guardian 'keep' detaches; un-kept twin flagged on submit", async () => {
     await admin("POST", "/admin/jobs", { jobs: [{ url: "https://jobs.lever.co/lambda/l-1", company: "Lambda", title: "SWE Intern Summer 2027" }] });
     await admin("POST", "/admin/jobs", { jobs: [{ url: "https://jobs.ashbyhq.com/lambda/l-2", company: "Lambda Inc", title: "Software Engineer Intern - Summer 2027" }] });
+    await admin("POST", "/admin/jobs", { jobs: [{ url: "https://boards.greenhouse.io/lambda/jobs/3", company: "Lambda", title: "Software Engineering Intern (Summer 2027)" }] });
     const twins = (await admin("GET", "/admin/jobs")).body.jobs.filter((j) => j.company.startsWith("Lambda"));
-    const second = twins.find((j) => j.url.includes("ashby"));
+    const [first, second, third] = twins;
+    assert.equal(first.status, "pending");
     assert.equal(second.status, "needs_human", "second copy flagged at push");
-    await admin("PATCH", `/admin/jobs/${second.id}`, { status: "pending" }); // guardian says: different role, keep
+    assert.equal(third.status, "needs_human", "third copy flagged at push");
+    await admin("PATCH", `/admin/jobs/${second.id}`, { status: "pending", reason: "different team, keep" });
     const wA = (await call(c, "start_session")).worker_id;
-    const wB = (await call(c2, "start_session")).worker_id;
     const a = await call(c, "get_next_job", { worker_id: wA });
-    const b = await call(c2, "get_next_job", { worker_id: wB });
-    assert.ok(a.job.company.startsWith("Lambda"));
-    assert.ok(!b.job_id || !b.job.company.startsWith("Lambda"), "twin not leased concurrently");
+    assert.equal(a.job_id, first.id);
     await call(c, "report_result", { ...L(wA, a), status: "submitted" });
-    const after = (await admin("GET", "/admin/jobs")).body.jobs.find((j) => j.id === (a.job_id === second.id ? twins.find((t) => t.id !== second.id).id : second.id));
-    assert.equal(after.status, "needs_human");
-    assert.match(after.status_reason, /possible_duplicate_of/);
-    if (b.job_id) await call(c2, "report_result", { ...L(wB, b), status: "skipped" });
+    const after = (await admin("GET", "/admin/jobs")).body.jobs;
+    assert.equal(after.find((j) => j.id === second.id).status, "pending", "kept job is not re-flagged");
+    assert.match(after.find((j) => j.id === third.id).status_reason, /possible_duplicate/);
+    const b = await call(c, "get_next_job", { worker_id: wA });
+    assert.equal(b.job_id, second.id, "kept job is leasable after its twin was submitted");
+    await call(c, "report_result", { ...L(wA, b), status: "skipped" });
+  });
+  await test("wrong passphrase then right one on the same consent page works", async () => {
+    const provider = makeAuthProvider(PASS);
+    provider.redirectToAuthorization = async (url) => {
+      const g = await fetch(url, { redirect: "manual" });
+      const cookies = g.headers.getSetCookie().map((x) => x.split(";")[0]).join("; ");
+      const handle = (await g.text()).match(/name="handle" value="([^"]+)"/)[1];
+      const post = (pp) => fetch(new URL("/authorize", url), { method: "POST", redirect: "manual", headers: { "Content-Type": "application/x-www-form-urlencoded", Cookie: cookies }, body: new URLSearchParams({ handle, passphrase: pp, decision: "approve" }) });
+      const bad = await post("nope");
+      assert.equal(bad.status, 401);
+      assert.match(await bad.text(), /Wrong passphrase/);
+      const good = await post(PASS);
+      assert.equal(good.status, 302);
+      provider._code = new URL(good.headers.get("Location")).searchParams.get("code");
+    };
+    const t = new StreamableHTTPClientTransport(new URL(BASE + "/mcp"), { authProvider: provider });
+    const cl = new Client({ name: "e2e3", version: "1" });
+    await assert.rejects(() => cl.connect(t));
+    assert.ok(provider._code);
+    await t.finishAuth(provider._code);
+    const cl2 = new Client({ name: "e2e3", version: "1" });
+    await cl2.connect(new StreamableHTTPClientTransport(new URL(BASE + "/mcp"), { authProvider: provider }));
+    await cl2.close();
+  });
+  await test("bank:false answers are not reused by other jobs", async () => {
+    await admin("POST", "/admin/jobs", { jobs: [{ url: "https://jobs.lever.co/mu/m-1", company: "Mu", title: "Backend Intern" }, { url: "https://jobs.lever.co/nu/n-1", company: "Nu", title: "Backend Intern" }] });
+    const w = (await call(c, "start_session")).worker_id;
+    const a = await call(c, "get_next_job", { worker_id: w });
+    const q = await call(c, "ask_guardian", { ...L(w, a), question: "Why this team specifically?", kind: "freeform" });
+    await admin("POST", `/admin/questions/${q.question_id}/answer`, { answer: "Because of team-specific reason", bank: false });
+    await call(c, "report_result", { ...L(w, a), status: "skipped" });
+    const b = await call(c, "get_next_job", { worker_id: w });
+    assert.ok(b.job_id && b.job_id !== a.job_id);
+    const q2 = await call(c, "ask_guardian", { ...L(w, b), question: "Why this team specifically?", kind: "freeform" });
+    assert.notEqual(q2.question_id, q.question_id);
+    assert.equal(q2.status, "pending");
+    await call(c, "report_result", { ...L(w, b), status: "skipped" });
   });
   await test("admin still works after many bad-token attempts", async () => {
     for (let i = 0; i < 35; i++) await fetch(BASE + "/admin/stats", { headers: { Authorization: "Bearer nope" } });

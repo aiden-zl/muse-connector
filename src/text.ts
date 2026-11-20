@@ -18,7 +18,10 @@ export interface BankEntry {
   keywords: string | null;
 }
 
-/** Find the best answer-bank entry for a question. Exact normalized match wins; else all-keywords match. */
+const NEGATION = /\b(not|no|without|never|dont|don t|doesnt|doesn t|wont|won t|cannot|can t|unable|neither|nor|except)\b/;
+
+/** Find the best answer-bank entry for a question. Exact normalized match wins; else all-keywords match.
+ *  A keyword match is rejected when only one side is negated ("require sponsorship" vs "work WITHOUT sponsorship"). */
 export function matchAnswer(question: string, bank: BankEntry[]): BankEntry | null {
   const n = normText(question);
   if (!n) return null;
@@ -31,7 +34,7 @@ export function matchAnswer(question: string, bank: BankEntry[]): BankEntry | nu
     if (!b.keywords) continue;
     const kws = b.keywords.split(",").map((k) => normText(k)).filter(Boolean);
     if (!kws.length) continue;
-    const ok = kws.every((k) => (k.includes(" ") ? n.includes(k) : words.has(k)));
+    const ok = kws.every((k) => (k.includes(" ") ? n.includes(k) : words.has(k))) && NEGATION.test(n) === NEGATION.test(b.norm);
     if (ok && kws.length > bestScore) {
       best = b;
       bestScore = kws.length;

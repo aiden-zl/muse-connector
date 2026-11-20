@@ -76,6 +76,8 @@ describe("text", () => {
     expect(matchAnswer("Are you legally authorized to work in the United States?", bank)?.answer).toBe("Yes");
     expect(matchAnswer("Will you now or in the future require visa sponsorship?", bank)?.answer).toBe("No");
     expect(matchAnswer("What is your favorite color?", bank)).toBeNull();
+    expect(matchAnswer("Are you able to work without sponsorship?", bank)).toBeNull();
+    expect(matchAnswer("Are you NOT authorized to work here?", bank)).toBeNull();
   });
   it("scrub hides codes and password-like tokens", () => {
     expect(scrub("code 482913 sent")).toBe("code [digits] sent");

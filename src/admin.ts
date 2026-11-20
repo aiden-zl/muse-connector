@@ -177,9 +177,12 @@ export async function handleAdmin(req: Request, env: Env): Promise<Response> {
              not_before = NULL, waiting_since = NULL, submitted_at = CASE WHEN ? = 'submitted' THEN COALESCE(submitted_at, ?) ELSE submitted_at END,
              expired_leases = CASE WHEN ? = 'pending' THEN 0 ELSE expired_leases END,
              attempts = CASE WHEN ? = 'pending' THEN 0 ELSE attempts END,
-             defers = CASE WHEN ? = 'pending' THEN 0 ELSE defers END, updated_at = ? WHERE id = ?`,
+             defers = CASE WHEN ? = 'pending' THEN 0 ELSE defers END,
+             soft_key = CASE WHEN ? IN ('pending','ready') AND status IN ('needs_human') AND soft_key NOT LIKE '%#keep:%'
+                             THEN soft_key || '#keep:' || id ELSE soft_key END,
+             updated_at = ? WHERE id = ?`,
         )
-        .bind(status, b.reason ? String(b.reason).slice(0, 300) : `guardian:${status}`, status, t, status, status, status, t, id),
+        .bind(status, b.reason ? String(b.reason).slice(0, 300) : `guardian:${status}`, status, t, status, status, status, status, t, id),
       ...(status === "submitted" ? siblingStmts(db, job.soft_key, id, t) : []),
       db.prepare("UPDATE lease_history SET final_status = 'cancelled' WHERE job_id = ? AND final_status IS NULL").bind(id),
       db.prepare("DELETE FROM job_blockers WHERE job_id = ?").bind(id),
@@ -215,7 +218,9 @@ export async function handleAdmin(req: Request, env: Env): Promise<Response> {
     if (!q) return json({ error: "not found" }, 404);
     if (q.status !== "open") return json({ error: `question is ${q.status}` }, 409);
     const t = Date.now();
-    const stmts: D1PreparedStatement[] = [db.prepare("UPDATE questions SET status = 'answered', answer = ?, answered_at = ? WHERE id = ? AND status = 'open'").bind(answer, t, id)];
+    const stmts: D1PreparedStatement[] = [
+      db.prepare("UPDATE questions SET status = 'answered', answer = ?, answered_at = ?, job_only = ? WHERE id = ? AND status = 'open'").bind(answer, t, b.bank === false ? 1 : 0, id),
+    ];
     if (q.kind === "essay") {
       const [cn, pn] = q.norm.split("|");
       const job = await db.prepare("SELECT company FROM jobs WHERE id = ?").bind(q.job_id).first<{ company: string }>();

@@ -72,6 +72,7 @@ CREATE TABLE questions (
   status TEXT NOT NULL DEFAULT 'open',
   answer TEXT,
   flags TEXT,
+  job_only INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   answered_at INTEGER
 );
