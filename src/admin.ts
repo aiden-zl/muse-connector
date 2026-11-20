@@ -1,11 +1,11 @@
 // Guardian-only REST API. Bearer ADMIN_TOKEN in the Authorization header. No CORS: browsers never call this.
 import type { Env } from "./env";
 import { ctEqual } from "./crypto";
-import { bump, peek } from "./auth";
+import { bump } from "./auth";
 import { jobKeys, normCompany, normText, softKey } from "./keys";
 import { forbiddenPii, JOB_SPECIFIC_KINDS } from "./text";
 import { decryptSecret, importCredKey } from "./crypto";
-import { getConfig, housekeeping, logEvent, progress, promoteStmt, type JobRow } from "./queue";
+import { getConfig, housekeeping, logEvent, progress, promoteStmt, siblingStmts, type JobRow } from "./queue";
 
 const MIN = 60_000;
 
@@ -17,6 +17,7 @@ const CONFIG_KEYS = new Set([
   "lease_minutes",
   "submit_extend_minutes",
   "max_attempts",
+  "max_defers",
   "max_expired_leases",
   "max_answer_polls",
   "code_wait_s",
@@ -30,14 +31,13 @@ const JOB_STATUSES = new Set(["pending", "ready", "skipped", "submitted", "needs
 const ELIGIBILITY = new Set(["explicit_2029", "range_includes_2029", "unstated"]);
 
 async function authorized(req: Request, env: Env): Promise<Response | null> {
-  if ((await peek(env.DB, "admin_fail", 60 * MIN)) >= 30) return json({ error: "locked" }, 429);
   const h = req.headers.get("Authorization") ?? "";
   const tok = h.startsWith("Bearer ") ? h.slice(7) : "";
-  if (!env.ADMIN_TOKEN || !tok || !(await ctEqual(tok, env.ADMIN_TOKEN))) {
-    await bump(env.DB, "admin_fail", 60 * MIN);
-    return json({ error: "unauthorized" }, 401);
-  }
-  return null;
+  // a valid token always passes, so attackers can never lock the guardian out
+  if (env.ADMIN_TOKEN && tok && (await ctEqual(tok, env.ADMIN_TOKEN))) return null;
+  const ip = req.headers.get("CF-Connecting-IP") ?? "local";
+  const n = await bump(env.DB, `admin_fail_ip:${ip}`, 60 * MIN);
+  return json({ error: n > 30 ? "too many attempts" : "unauthorized" }, n > 30 ? 429 : 401);
 }
 
 export async function handleAdmin(req: Request, env: Env): Promise<Response> {
@@ -166,7 +166,7 @@ export async function handleAdmin(req: Request, env: Env): Promise<Response> {
     const b = await body();
     const status = String(b.status ?? "");
     if (!JOB_STATUSES.has(status)) return json({ error: `status must be one of ${[...JOB_STATUSES].join(", ")}` }, 400);
-    const job = await db.prepare("SELECT status FROM jobs WHERE id = ?").bind(id).first<{ status: string }>();
+    const job = await db.prepare("SELECT status, soft_key FROM jobs WHERE id = ?").bind(id).first<{ status: string; soft_key: string }>();
     if (!job) return json({ error: "not found" }, 404);
     if (job.status === "submitted" && status !== "submitted" && !b.force) return json({ error: "job is submitted; pass force:true to change" }, 409);
     const t = Date.now();
@@ -176,9 +176,11 @@ export async function handleAdmin(req: Request, env: Env): Promise<Response> {
           `UPDATE jobs SET status = ?, status_reason = ?, lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL,
              not_before = NULL, waiting_since = NULL, submitted_at = CASE WHEN ? = 'submitted' THEN COALESCE(submitted_at, ?) ELSE submitted_at END,
              expired_leases = CASE WHEN ? = 'pending' THEN 0 ELSE expired_leases END,
-             attempts = CASE WHEN ? = 'pending' THEN 0 ELSE attempts END, updated_at = ? WHERE id = ?`,
+             attempts = CASE WHEN ? = 'pending' THEN 0 ELSE attempts END,
+             defers = CASE WHEN ? = 'pending' THEN 0 ELSE defers END, updated_at = ? WHERE id = ?`,
         )
-        .bind(status, b.reason ? String(b.reason).slice(0, 300) : `guardian:${status}`, status, t, status, status, t, id),
+        .bind(status, b.reason ? String(b.reason).slice(0, 300) : `guardian:${status}`, status, t, status, status, status, t, id),
+      ...(status === "submitted" ? siblingStmts(db, job.soft_key, id, t) : []),
       db.prepare("UPDATE lease_history SET final_status = 'cancelled' WHERE job_id = ? AND final_status IS NULL").bind(id),
       db.prepare("DELETE FROM job_blockers WHERE job_id = ?").bind(id),
     ]);
@@ -311,7 +313,7 @@ export async function handleAdmin(req: Request, env: Env): Promise<Response> {
   if (cm && m === "GET") {
     const kt = req.headers.get("X-Keychain-Token") ?? "";
     if (!env.KEYCHAIN_TOKEN || !(await ctEqual(kt, env.KEYCHAIN_TOKEN))) {
-      await bump(db, "admin_fail", 60 * MIN);
+      await bump(db, "keychain_fail", 60 * MIN);
       return json({ error: "keychain token required" }, 401);
     }
     if ((await bump(db, "cred_reads", 60 * MIN)) > 500) return json({ error: "rate limited" }, 429);
@@ -348,7 +350,7 @@ export async function handleAdmin(req: Request, env: Env): Promise<Response> {
     return json({ ok: true });
   }
   if (path === "/admin/unlock" && m === "POST") {
-    await db.prepare("DELETE FROM rate_limits WHERE key LIKE 'auth_fail%' OR key = 'admin_fail'").run();
+    await db.prepare("DELETE FROM rate_limits WHERE key LIKE 'auth_fail%' OR key LIKE 'admin_fail%'").run();
     return json({ ok: true });
   }
   if (path === "/admin/revoke-grants" && m === "POST") {

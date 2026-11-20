@@ -126,6 +126,10 @@ export function softKey(company: string, title: string): string {
     .replace(/\b20\d\d\b/g, "")
     .replace(/\b(the|a|an|and|of|for|in|at|to|program|position|role|opening)\b/g, "")
     .replace(/\binternship\b/g, "intern")
+    .replace(/\b(swe|sde|software development engineer|software engineering|software developer)\b/g, "software engineer")
+    .replace(/\bquantitative\b/g, "quant")
+    .replace(/\bml\b/g, "machine learning")
+    .replace(/\b(co op|coop)\b/g, "intern")
     .replace(/\s+/g, " ")
     .trim();
   return `${normCompany(company)}|${core}|${year}`;

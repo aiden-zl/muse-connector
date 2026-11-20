@@ -14,9 +14,11 @@ umask 077
 W="npx --yes wrangler"
 
 echo "==> 1/7 Cloudflare login"
-if ! $W whoami 2>/dev/null | grep -q "You are logged in"; then
-  $W login
-fi
+WHO=$($W whoami 2>&1 || true)
+case "$WHO" in
+  *"You are logged in"*) ;;
+  *) $W login ;;
+esac
 
 echo "==> 2/7 D1 database + KV namespace"
 DB_ID=$($W d1 list --json 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const l=JSON.parse(s);const d=l.find(x=>x.name==="muse-bridge");process.stdout.write(d?(d.uuid||d.id||""):"")}catch{}})')
@@ -46,6 +48,13 @@ CI=1 $W d1 migrations apply DB --remote
 
 echo "==> 4/7 Secrets"
 if [ ! -f "$SECRETS" ]; then
+  # A new CRED_KEY would make every stored portal password unreadable — refuse if any exist.
+  NCRED=$($W d1 execute DB --remote --json --command "SELECT COUNT(*) AS n FROM credentials" 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s)[0].results[0].n))}catch{process.stdout.write("0")}})')
+  if [ "${NCRED:-0}" != "0" ] && [ "${FORCE_NEW_SECRETS:-}" != "1" ]; then
+    echo "    $SECRETS is missing but the database already holds $NCRED credentials."
+    echo "    Restore secrets.json (CRED_KEY backup is in Keychain: muse-bridge-cred-key-backup) or re-run with FORCE_NEW_SECRETS=1."
+    exit 1
+  fi
   node -e '
     const c=require("crypto");
     const words=()=>Array.from({length:5},()=>c.randomBytes(4).toString("base64url").replace(/[-_]/g,"x").slice(0,5).toLowerCase()).join("-");
@@ -61,7 +70,7 @@ cp "$SECRETS" "$TMP_SECRETS"
 node -e '
   const s=require(process.argv[1]);
   process.stdout.write(`add-generic-password -U -s muse-bridge-keychain-token -a muse-bridge -w ${s.KEYCHAIN_TOKEN}\n`+
-    `add-generic-password -U -s muse-bridge-cred-key-backup -a muse-bridge -w ${s.CRED_KEY.replace(/[+/=]/g,m=>({"+":"-","/":"_","=":""})[m])}\n`);' "$SECRETS" | security -i >/dev/null 2>&1 || echo "    (could not write to Keychain; KEYCHAIN_TOKEN stays only in $SECRETS)"
+    `add-generic-password -U -s muse-bridge-cred-key-backup -a muse-bridge -w ${s.CRED_KEY}\n`);' "$SECRETS" | security -i >/dev/null 2>&1 || echo "    (could not write to Keychain; KEYCHAIN_TOKEN stays only in $SECRETS)"
 
 echo "==> 5/7 First deploy (to learn the workers.dev URL)"
 OUT=$($W deploy --secrets-file "$TMP_SECRETS" 2>&1 | grep -v -i secret | tee /dev/stderr)

@@ -11,7 +11,7 @@
 import type { Env, NextAction, ToolResult } from "./env";
 import { END_SESSION, na } from "./env";
 import { normCompany, normText } from "./keys";
-import { clip, dangerFlags, JOB_SPECIFIC_KINDS, matchAnswer, QUESTION_KINDS, scrub, type BankEntry } from "./text";
+import { clip, dangerFlags, JOB_SPECIFIC_KINDS, LEASE_BOUND_KINDS, matchAnswer, QUESTION_KINDS, scrub, type BankEntry } from "./text";
 import { decryptSecret, encryptSecret, generatePassword, importCredKey, randomToken } from "./crypto";
 
 const MIN = 60_000;
@@ -39,6 +39,7 @@ export interface JobRow {
   leases: number;
   expired_leases: number;
   attempts: number;
+  defers: number;
   not_before: number | null;
   waiting_since: number | null;
   priority: number;
@@ -212,16 +213,21 @@ export async function getNextJob(env: Env, workerId: string): Promise<ToolResult
            WHERE j.status IN ('ready','pending') AND COALESCE(j.not_before, 0) <= ?
              AND NOT EXISTS (SELECT 1 FROM jobs h WHERE h.lease_owner = ? AND h.status IN ('leased','submitting'))
              AND NOT EXISTS (SELECT 1 FROM jobs s WHERE s.site_key = j.site_key AND s.status IN ('leased','submitting'))
+             AND NOT EXISTS (SELECT 1 FROM jobs d WHERE d.soft_key = j.soft_key AND d.id != j.id
+                               AND d.status IN ('leased','submitting','submitted','possibly_submitted'))
            ORDER BY (j.status = 'ready') DESC, j.priority DESC, j.created_at, j.id
            LIMIT 1)
          AND status IN ('ready','pending')
          RETURNING *`,
       )
       .bind(token, workerId, t + leaseMs, t, t, workerId),
+    // recorded in the same transaction so a lease can never exist without its history row
+    db
+      .prepare("INSERT INTO lease_history (token, job_id, worker_id, issued_at) SELECT lease_token, id, lease_owner, ? FROM jobs WHERE lease_token = ?")
+      .bind(t, token),
   ]);
   const job = (res[0].results as JobRow[])[0];
   if (job) {
-    await db.prepare("INSERT INTO lease_history (token, job_id, worker_id, issued_at) VALUES (?, ?, ?, ?)").bind(token, job.id, workerId, t).run();
     await logEvent(db, "muse", "leased", job.id, { worker_id: workerId, leases: job.leases });
     await maybeFlagBatchLow(db, cfg);
     return jobPayload(env, job, cfg, workerId);
@@ -428,6 +434,18 @@ export async function askGuardian(
   const options = Array.isArray(a.options) ? a.options.slice(0, 50).map((o) => clip(String(o), 300)) : [];
   const flags = dangerFlags(question, a.context, ...options.map(String));
 
+  if (kind === "approval") {
+    const prior = await db
+      .prepare(`SELECT id, status, answer FROM questions WHERE job_id = ? AND kind = 'approval' AND norm = ? AND status IN ('open','answered') ORDER BY id DESC LIMIT 1`)
+      .bind(job.id, norm)
+      .first<{ id: number; status: string; answer: string | null }>();
+    if (prior?.status === "answered" && prior.answer != null) {
+      return { ok: true, question_id: prior.id, status: "answered", answer: prior.answer, next_action: na("none", {}, "Follow the guardian's answer.") };
+    }
+    if (prior?.status === "open") {
+      return { ok: true, question_id: prior.id, status: "pending", next_action: na("get_answer", { ...ids, question_id: prior.id }, "Check for the answer.") };
+    }
+  }
   if (!JOB_SPECIFIC_KINDS.has(kind)) {
     // cross-job dedupe: an identical question already answered → return the answer right away
     const prior = await db
@@ -452,7 +470,7 @@ export async function askGuardian(
       `INSERT INTO questions (job_id, lease_token, kind, question, norm, options_json, context, status, flags, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?) RETURNING id`,
     )
-    .bind(job.id, JOB_SPECIFIC_KINDS.has(kind) ? job.lease_token : null, kind, question, norm, JSON.stringify(options), clip(a.context, 3000), flags.join(",") || null, now())
+    .bind(job.id, LEASE_BOUND_KINDS.has(kind) ? job.lease_token : null, kind, question, norm, JSON.stringify(options), clip(a.context, 3000), flags.join(",") || null, now())
     .first<{ id: number }>();
   const qid = ins!.id;
   await logEvent(db, "muse", "question", job.id, { question_id: qid, kind, flags });
@@ -477,10 +495,12 @@ export async function getAnswer(env: Env, a: LeaseArgs & { question_id?: number 
   const jobId = Number(a.job_id) || 0;
   const ids = { worker_id: workerId, job_id: jobId || undefined, lease_token: a.lease_token };
   if (JOB_SPECIFIC_KINDS.has(q.kind)) {
-    // verification codes / approvals only go to the lease that asked
-    if (!a.lease_token || q.lease_token !== a.lease_token) return fail("not_your_question", "This answer belongs to a different job lease.", nextJob(workerId));
+    // approvals only go to whoever holds that job now; verification codes only to the exact lease that asked
     const l = await requireLease(env, a);
     if (isFail(l)) return l;
+    if (l.job.id !== q.job_id || (LEASE_BOUND_KINDS.has(q.kind) && q.lease_token !== a.lease_token)) {
+      return fail("not_your_question", "This answer belongs to a different job.", nextJob(workerId));
+    }
   }
   if (q.status === "answered" && q.answer != null) {
     return { ok: true, question_id: qid, status: "answered", answer: q.answer, next_action: na("none", {}, "Use the answer and keep going.") };
@@ -609,7 +629,7 @@ export async function getOrCreateCredential(env: Env, a: LeaseArgs): Promise<Too
     return fail("no_application_email", "The guardian has not set the application email yet.", na("defer_job", { ...ids, blocking_question_ids: [], reason: "no application email configured" }, "Park this job."));
   }
   const key = await importCredKey(env.CRED_KEY);
-  let row = await db.prepare("SELECT * FROM credentials WHERE site_key = ?").bind(siteKey).first<{ id: number; login_email: string; password_ciphertext: string | null; iv: string | null; key_version: number }>();
+  let row = await db.prepare("SELECT * FROM credentials WHERE site_key = ?").bind(siteKey).first<{ id: number; login_email: string; password_ciphertext: string | null; iv: string | null; key_version: number; created_at: number }>();
   let created = false;
   if (!row) {
     const recent = await db.prepare("SELECT COUNT(*) AS n FROM credentials WHERE created_at > ?").bind(now() - 60 * MIN).first<{ n: number }>();
@@ -628,6 +648,11 @@ export async function getOrCreateCredential(env: Env, a: LeaseArgs): Promise<Too
       created = true;
     }
     row = await db.prepare("SELECT * FROM credentials WHERE site_key = ?").bind(siteKey).first();
+  }
+  if (row && (!row.password_ciphertext || !row.iv) && (row as any).created_at < now() - 60_000) {
+    // a creator died between insert and encrypt: discard the empty row so the next call recreates it
+    await db.prepare("DELETE FROM credentials WHERE id = ? AND password_ciphertext IS NULL").bind(row.id).run();
+    return fail("credential_busy", "Credential slot was reset.", na("get_or_create_credential", ids, "Retry once now."));
   }
   if (!row?.password_ciphertext || !row.iv) {
     return fail("credential_busy", "Credential is being created by another session.", na("get_or_create_credential", ids, "Retry once."));
@@ -660,7 +685,7 @@ export async function beginSubmit(env: Env, a: LeaseArgs): Promise<ToolResult> {
     .run();
   await logEvent(env.DB, "muse", "begin_submit", l.job.id);
   const ids = { worker_id: a.worker_id, job_id: l.job.id, lease_token: l.job.lease_token };
-  return { ok: true, status: "submitting", next_action: na("report_result", { ...ids, status: "submitted", confirmation: "<confirmation text>" }, "Click Submit now, then report the result (submitted or failed).") };
+  return { ok: true, status: "submitting", next_action: na("report_result", { ...ids, status: "submitted", confirmation: "<confirmation text>" }, "Click Submit now, then report the result. If you are not sure whether it went through, report status=\"needs_human\".") };
 }
 
 const REPORT_STATUSES = ["submitted", "failed", "skipped", "needs_human"];
@@ -699,13 +724,7 @@ export async function reportResult(env: Env, a: LeaseArgs & { status?: string; n
       db.prepare("UPDATE lease_history SET final_status = 'submitted' WHERE token = ?").bind(token),
       // cancel any newer lease on this job
       db.prepare("UPDATE lease_history SET final_status = 'cancelled' WHERE job_id = ? AND token != ? AND final_status IS NULL").bind(jobId, token),
-      // soft-key siblings become possible duplicates for the guardian to resolve
-      db
-        .prepare(
-          `UPDATE jobs SET status = 'needs_human', status_reason = ?, updated_at = ?
-           WHERE soft_key = ? AND id != ? AND status IN ('pending','ready','waiting')`,
-        )
-        .bind(`possible_duplicate_of:${jobId}`, t, job.soft_key, jobId),
+      ...siblingStmts(db, job.soft_key, jobId, t),
       ...endJobCleanup(db, jobId),
     ]);
     await logEvent(db, "muse", "submitted", jobId, { stale, notes });
@@ -725,8 +744,18 @@ export async function reportResult(env: Env, a: LeaseArgs & { status?: string; n
   const cfg = await getConfig(db);
   let newStatus = status;
   let reason: string | null = notes;
-  const stmts: D1PreparedStatement[] = [];
-  if (status === "failed") {
+  let upd: D1PreparedStatement;
+  if (job.status === "submitting" && status !== "skipped") {
+    // after begin_submit we can't know whether the click went through: never re-queue automatically
+    newStatus = "possibly_submitted";
+    reason = `reported ${status} after begin_submit: ${notes ?? ""}`;
+    upd = db
+      .prepare(
+        `UPDATE jobs SET status = 'possibly_submitted', status_reason = ?, last_error = ?, lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+         WHERE id = ? AND lease_token = ? AND status = 'submitting'`,
+      )
+      .bind(reason, notes, t, jobId, token);
+  } else if (status === "failed") {
     const attempts = job.attempts + 1;
     if (attempts >= num(cfg, "max_attempts", 3)) {
       newStatus = "needs_human";
@@ -734,25 +763,44 @@ export async function reportResult(env: Env, a: LeaseArgs & { status?: string; n
     } else {
       newStatus = "pending";
     }
-    stmts.push(
-      db
-        .prepare(
-          `UPDATE jobs SET status = ?, status_reason = ?, attempts = ?, last_error = ?, not_before = ?,
-             lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?`,
-        )
-        .bind(newStatus, reason, attempts, notes, newStatus === "pending" ? t + 30 * MIN : null, t, jobId),
-    );
+    upd = db
+      .prepare(
+        `UPDATE jobs SET status = ?, status_reason = ?, attempts = ?, last_error = ?, not_before = ?,
+           lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+         WHERE id = ? AND lease_token = ? AND status IN ('leased','submitting')`,
+      )
+      .bind(newStatus, reason, attempts, notes, newStatus === "pending" ? t + 30 * MIN : null, t, jobId, token);
   } else {
-    stmts.push(
-      db
-        .prepare(`UPDATE jobs SET status = ?, status_reason = ?, lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?`)
-        .bind(newStatus, reason, t, jobId),
-    );
+    upd = db
+      .prepare(
+        `UPDATE jobs SET status = ?, status_reason = ?, lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+         WHERE id = ? AND lease_token = ? AND status IN ('leased','submitting')`,
+      )
+      .bind(newStatus, reason, t, jobId, token);
   }
-  stmts.push(db.prepare("UPDATE lease_history SET final_status = ? WHERE token = ?").bind(status, token), ...endJobCleanup(db, jobId));
-  await db.batch(stmts);
+  const r = await upd.run();
+  if (!r.meta.changes) return fail("not_your_lease", "You no longer hold this job.", nextJob(workerId));
+  await db.batch([db.prepare("UPDATE lease_history SET final_status = ? WHERE token = ?").bind(status, token), ...endJobCleanup(db, jobId)]);
   await logEvent(db, "muse", status, jobId, { new_status: newStatus, notes });
   return { ok: true, status: newStatus, progress: await progress(db), next_action: nextJob(workerId) };
+}
+
+/** Same internship under another URL: park it for the guardian (cancels a sibling's lease if only 'leased'). */
+export function siblingStmts(db: D1Database, softKey: string, jobId: number, t: number): D1PreparedStatement[] {
+  return [
+    db
+      .prepare(
+        `UPDATE lease_history SET final_status = 'cancelled' WHERE final_status IS NULL AND token IN (
+           SELECT lease_token FROM jobs WHERE soft_key = ? AND id != ? AND status = 'leased')`,
+      )
+      .bind(softKey, jobId),
+    db
+      .prepare(
+        `UPDATE jobs SET status = 'needs_human', status_reason = ?, lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+         WHERE soft_key = ? AND id != ? AND status IN ('pending','ready','waiting','leased')`,
+      )
+      .bind(`possible_duplicate_of:${jobId}`, t, softKey, jobId),
+  ];
 }
 
 /** When a job leaves the waiting path: drop its blocker rows; expire ONLY its job-specific open questions. */
@@ -783,33 +831,34 @@ export async function deferJob(env: Env, a: LeaseArgs & { blocking_question_ids?
       .prepare(`SELECT id, status, kind FROM questions WHERE id IN (${ids.map(() => "?").join(",")})`)
       .bind(...ids)
       .all<{ id: number; status: string; kind: string }>();
-    open = results.filter((q) => q.status === "open" && !JOB_SPECIFIC_KINDS.has(q.kind)).map((q) => q.id);
+    open = results.filter((q) => q.status === "open" && !LEASE_BOUND_KINDS.has(q.kind)).map((q) => q.id);
     ignored = ids.filter((id) => !open.includes(id));
-    allAnswered = results.length === new Set(ids).size && results.every((q) => q.status === "answered" && !JOB_SPECIFIC_KINDS.has(q.kind));
+    allAnswered = results.length === new Set(ids).size && results.every((q) => q.status === "answered" && !LEASE_BOUND_KINDS.has(q.kind));
   }
-  const stmts: D1PreparedStatement[] = [];
+  const clear = "lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL";
+  const guard = "WHERE id = ? AND lease_token = ? AND status = 'leased'";
   let newStatus: string;
+  let upd: D1PreparedStatement;
   if (open.length) {
     newStatus = "waiting";
-    for (const qid of open) stmts.push(db.prepare("INSERT OR IGNORE INTO job_blockers (job_id, question_id) VALUES (?, ?)").bind(job.id, qid));
-    stmts.push(
-      db
-        .prepare(`UPDATE jobs SET status = 'waiting', waiting_since = ?, status_reason = ?, lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?`)
-        .bind(t, scrub(a.reason, 300), t, job.id),
-    );
+    upd = db.prepare(`UPDATE jobs SET status = 'waiting', waiting_since = ?, status_reason = ?, ${clear}, updated_at = ? ${guard}`).bind(t, scrub(a.reason, 300), t, job.id, job.lease_token);
   } else if (allAnswered) {
     newStatus = "ready"; // everything it was waiting on is already answered
-    stmts.push(
-      db.prepare(`UPDATE jobs SET status = 'ready', lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?`).bind(t, job.id),
-    );
+    upd = db.prepare(`UPDATE jobs SET status = 'ready', ${clear}, updated_at = ? ${guard}`).bind(t, job.id, job.lease_token);
+  } else if (job.defers + 1 >= num(l.cfg, "max_defers", 5)) {
+    newStatus = "needs_human";
+    upd = db
+      .prepare(`UPDATE jobs SET status = 'needs_human', defers = defers + 1, status_reason = ?, ${clear}, updated_at = ? ${guard}`)
+      .bind(`deferred ${job.defers + 1} times without a guardian question: ${scrub(a.reason, 200) ?? ""}`, t, job.id, job.lease_token);
   } else {
     newStatus = "pending";
-    stmts.push(
-      db
-        .prepare(`UPDATE jobs SET status = 'pending', not_before = ?, status_reason = ?, lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?`)
-        .bind(t + 15 * MIN, scrub(a.reason, 300), t, job.id),
-    );
+    upd = db
+      .prepare(`UPDATE jobs SET status = 'pending', defers = defers + 1, not_before = ?, status_reason = ?, ${clear}, updated_at = ? ${guard}`)
+      .bind(t + 15 * MIN, scrub(a.reason, 300), t, job.id, job.lease_token);
   }
+  const r = await upd.run();
+  if (!r.meta.changes) return fail("not_your_lease", "You no longer hold this job.", nextJob(String(a.worker_id)));
+  const stmts: D1PreparedStatement[] = open.map((qid) => db.prepare("INSERT OR IGNORE INTO job_blockers (job_id, question_id) VALUES (?, ?)").bind(job.id, qid));
   stmts.push(db.prepare("UPDATE lease_history SET final_status = 'deferred' WHERE token = ?").bind(job.lease_token));
   await db.batch(stmts);
   await logEvent(db, "muse", "deferred", job.id, { new_status: newStatus, blockers: open, reason: a.reason });

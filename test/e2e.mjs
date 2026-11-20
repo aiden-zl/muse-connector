@@ -406,6 +406,71 @@ async function main() {
     assert.equal(f2.status, "needs_human");
     await admin("POST", "/admin/config", { max_attempts: "3" });
   });
+  console.log("review fixes");
+  await test("failed after begin_submit → possibly_submitted (never re-queued)", async () => {
+    await admin("POST", "/admin/jobs", { jobs: [{ url: "https://jobs.lever.co/theta/t-1", company: "Theta", title: "Platform Intern" }] });
+    const w = (await call(c, "start_session")).worker_id;
+    const a = await call(c, "get_next_job", { worker_id: w });
+    assert.ok(a.job_id, JSON.stringify(a).slice(0, 200));
+    await call(c, "begin_submit", L(w, a));
+    const r = await call(c, "report_result", { ...L(w, a), status: "failed", notes: "spinner then error" });
+    assert.equal(r.status, "possibly_submitted");
+  });
+  await test("approval answer survives a re-lease of the same job", async () => {
+    await admin("POST", "/admin/jobs", { jobs: [{ url: "https://jobs.lever.co/iota/i-1", company: "Iota", title: "Data Intern" }] });
+    const w = (await call(c, "start_session")).worker_id;
+    const a = await call(c, "get_next_job", { worker_id: w });
+    const q = await call(c, "ask_guardian", { ...L(w, a), question: "Allow creating a portal account?", kind: "approval" });
+    const d = await call(c, "defer_job", { ...L(w, a), blocking_question_ids: [q.question_id] });
+    assert.equal(d.status, "waiting", "approval counts as a blocker");
+    await admin("POST", `/admin/questions/${q.question_id}/answer`, { answer: "Yes" });
+    const b = await call(c, "get_next_job", { worker_id: w });
+    assert.equal(b.job_id, a.job_id);
+    assert.ok(b.answered_questions.some((x) => x.answer === "Yes"), "approval in payload");
+    const again = await call(c, "ask_guardian", { ...L(w, b), question: "Allow creating a portal account?", kind: "approval" });
+    assert.equal(again.answer, "Yes", "re-asking under new lease returns the answer");
+    await call(c, "report_result", { ...L(w, b), status: "skipped" });
+  });
+  await test("repeated bare defers → needs_human (no infinite loop)", async () => {
+    await admin("POST", "/admin/config", { max_defers: "2" });
+    await admin("POST", "/admin/jobs", { jobs: [{ url: "https://jobs.lever.co/kappa/k-1", company: "Kappa", title: "Backend Intern" }] });
+    const w = (await call(c, "start_session")).worker_id;
+    const a = await call(c, "get_next_job", { worker_id: w });
+    assert.equal(a.job.company, "Kappa");
+    const d1 = await call(c, "defer_job", { ...L(w, a), reason: "x" });
+    assert.equal(d1.status, "pending");
+    await admin("PATCH", `/admin/jobs/${a.job_id}`, { status: "ready" }); // skip cool-down (keeps defers)
+    const b = await call(c, "get_next_job", { worker_id: w });
+    assert.equal(b.job_id, a.job_id);
+    const d2 = await call(c, "defer_job", { ...L(w, b), reason: "x" });
+    assert.equal(d2.status, "needs_human");
+    await admin("POST", "/admin/config", { max_defers: "5" });
+  });
+  await test("soft-key sibling is never leased while its twin is held; flagged when twin submits", async () => {
+    await admin("POST", "/admin/jobs", { jobs: [{ url: "https://jobs.lever.co/lambda/l-1", company: "Lambda", title: "SWE Intern Summer 2027" }] });
+    await admin("POST", "/admin/jobs", { jobs: [{ url: "https://jobs.ashbyhq.com/lambda/l-2", company: "Lambda Inc", title: "Software Engineer Intern - Summer 2027" }] });
+    const twins = (await admin("GET", "/admin/jobs")).body.jobs.filter((j) => j.company.startsWith("Lambda"));
+    const second = twins.find((j) => j.url.includes("ashby"));
+    assert.equal(second.status, "needs_human", "second copy flagged at push");
+    await admin("PATCH", `/admin/jobs/${second.id}`, { status: "pending" }); // guardian says: different role, keep
+    const wA = (await call(c, "start_session")).worker_id;
+    const wB = (await call(c2, "start_session")).worker_id;
+    const a = await call(c, "get_next_job", { worker_id: wA });
+    const b = await call(c2, "get_next_job", { worker_id: wB });
+    assert.ok(a.job.company.startsWith("Lambda"));
+    assert.ok(!b.job_id || !b.job.company.startsWith("Lambda"), "twin not leased concurrently");
+    await call(c, "report_result", { ...L(wA, a), status: "submitted" });
+    const after = (await admin("GET", "/admin/jobs")).body.jobs.find((j) => j.id === (a.job_id === second.id ? twins.find((t) => t.id !== second.id).id : second.id));
+    assert.equal(after.status, "needs_human");
+    assert.match(after.status_reason, /possible_duplicate_of/);
+    if (b.job_id) await call(c2, "report_result", { ...L(wB, b), status: "skipped" });
+  });
+  await test("admin still works after many bad-token attempts", async () => {
+    for (let i = 0; i < 35; i++) await fetch(BASE + "/admin/stats", { headers: { Authorization: "Bearer nope" } });
+    const r = await admin("GET", "/admin/stats");
+    assert.equal(r.status, 200);
+  });
+
   console.log("pause");
   await test("pause stops new leases with an explicit end-session action", async () => {
     await admin("POST", "/admin/config", { paused: "1" });

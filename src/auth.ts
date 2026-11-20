@@ -84,7 +84,7 @@ export async function handleAuthorize(req: Request, env: Env): Promise<Response>
     }
     if (req.method !== "POST") return text("Method not allowed", 405);
 
-    if ((await peek(env.DB, "auth_fail_global", 24 * 60 * MIN)) >= 20) return text("Locked. The guardian must unlock the bridge.", 429);
+    if ((await peek(env.DB, "auth_fail_global", 24 * 60 * MIN)) >= 100) return text("Locked. The guardian must unlock the bridge.", 429);
     if ((await peek(env.DB, `auth_fail_ip:${ip}`, 10 * MIN)) >= 5) return text("Too many attempts. Wait 10 minutes.", 429);
 
     const f = await req.formData();

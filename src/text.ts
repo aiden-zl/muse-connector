@@ -3,8 +3,10 @@ import { normText } from "./keys";
 
 export { normText };
 
-/** Kinds whose answers are specific to one job/lease: never deduped, never banked. */
+/** Kinds whose answers are specific to one job: never deduped across jobs, never banked. */
 export const JOB_SPECIFIC_KINDS = new Set(["verification_code", "approval"]);
+/** Kinds whose answers are bound to a single lease (codes expire in minutes). Never a defer blocker. */
+export const LEASE_BOUND_KINDS = new Set(["verification_code"]);
 export const QUESTION_KINDS = ["choice", "freeform", "essay", "approval", "verification_code", "other"] as const;
 export type QuestionKind = (typeof QUESTION_KINDS)[number];
 
