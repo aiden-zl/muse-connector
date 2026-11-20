@@ -13,7 +13,7 @@ Claude ── guardian CLI (admin API) ┘   + macOS Keychain mirror of portal p
 
 ## Status: built and tested locally, not deployed yet
 
-- 14 unit tests and 36 end-to-end tests pass (`npm test`, `npm run e2e`). The end-to-end tests drive a real MCP client
+- 22 unit tests and 41 end-to-end tests pass (`npm test`, `npm run e2e`). The end-to-end tests drive a real MCP client
   through the full OAuth flow against `wrangler dev`.
 - Deploying needs **your** Cloudflare login, which can't be done unattended.
 

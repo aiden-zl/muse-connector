@@ -6,3 +6,6 @@ node_modules/
 dist/
 batches/*.csv
 !batches/example.csv
+essays/
+my-*.json
+applications.csv
