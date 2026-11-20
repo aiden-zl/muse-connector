@@ -1,0 +1,8 @@
+node_modules/
+.wrangler/
+.dev.vars
+*.secrets.json
+.e2e-state/
+dist/
+batches/*.csv
+!batches/example.csv

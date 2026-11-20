@@ -1,0 +1,12 @@
+[
+  { "question": "Are you legally authorized to work in the United States?", "answer": "FILL IN", "keywords": "authorized,work" },
+  { "question": "Will you now or in the future require sponsorship for employment visa status?", "answer": "FILL IN", "keywords": "sponsorship" },
+  { "question": "What is your expected graduation date?", "answer": "May 2029", "keywords": "graduation" },
+  { "question": "How did you hear about this position?", "answer": "Company careers website", "keywords": "hear,about" },
+  { "question": "Gender", "answer": "Decline to self-identify", "keywords": "gender" },
+  { "question": "Race/Ethnicity", "answer": "Decline to self-identify", "keywords": "race" },
+  { "question": "Veteran status", "answer": "I am not a protected veteran", "keywords": "veteran" },
+  { "question": "Disability status", "answer": "I do not wish to answer", "keywords": "disability" },
+  { "question": "Are you willing to relocate?", "answer": "Yes", "keywords": "relocate" },
+  { "question": "Have you previously worked for this company?", "answer": "No", "keywords": "previously,worked" }
+]
