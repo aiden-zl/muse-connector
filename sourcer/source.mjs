@@ -20,6 +20,31 @@ const ONLY_WORKDAY = process.argv.includes("--only-workday");
 const WORKDAY_BUDGET_MS = 60_000;
 const companies = JSON.parse(readFileSync(args.companies ?? join(here, "companies.json"), "utf8"));
 const batchesDir = join(here, "..", "batches");
+
+// The applicant's master tracker (company_list_300.xlsx), exported by `guardian/tracker.py export`.
+// Companies already applied to / skipped there are never sourced, and boards linked there are added as sources.
+const TRACKER = join(here, "..", "private", "tracker_export.json");
+const tracker = existsSync(TRACKER) ? JSON.parse(readFileSync(TRACKER, "utf8")) : null;
+const SUFFIX = /\b(inc|llc|ltd|corp|corporation|co|company|group|holdings|technologies|technology|labs|the|usa|us|careers|jobs)\b/g;
+const normName = (s) => String(s ?? "").toLowerCase().replace(/&/g, " and ").replace(/[^a-z0-9 ]/g, " ").replace(SUFFIX, " ").split(/\s+/).filter(Boolean).join(" ");
+const nameVariants = (c) => [normName(String(c).replace(/\(.*?\)/g, "")), ...[...String(c).matchAll(/\((.*?)\)/g)].map((m) => normName(m[1]))].filter(Boolean);
+const EXCLUDED = new Set(tracker?.exclude_names ?? []);
+const isExcludedCompany = (c) => nameVariants(c).some((n) => EXCLUDED.has(n));
+if (tracker && !args.companies) {
+  const add = (list, v) => { if (v && !list.includes(v)) list.push(v); };
+  for (const raw of tracker.source_urls ?? []) {
+    let u; try { u = new URL(raw.replace(/[|,;)]+$/, "")); } catch { continue; }
+    const p = u.pathname.split("/").filter(Boolean);
+    if (/(^|\.)greenhouse\.io$/.test(u.hostname) && p.length >= 2 && p[0] !== "embed") add(companies.greenhouse, p[0].toLowerCase());
+    else if (u.hostname === "jobs.lever.co" && p[0]) add(companies.lever, p[0].toLowerCase());
+    else if (u.hostname === "jobs.ashbyhq.com" && p[0]) add(companies.ashby, p[0].toLowerCase());
+    else {
+      const wd = u.hostname.match(/^([a-z0-9-]+)\.(wd\d+)\.myworkdayjobs\.com$/);
+      const site = p.find((x, i) => !/^[a-z]{2}-[A-Z]{2}$/.test(x) && p[i + 1] === "job");
+      if (wd && site) add(companies.workday ??= [], `${wd[1]}/${wd[2]}/${site}`);
+    }
+  }
+}
 const OUT = args.out ?? nextBatchName();
 
 function nextBatchName() {
@@ -193,9 +218,12 @@ async function main() {
         stats.intern_titles++;
         const e = classify(j.title, j.text);
         if (e.eligibility === "excludes_2029") { stats.excluded_grad_year++; continue; }
+        // applicant is a Canadian citizen on F-1: postings that require U.S. persons / citizenship / clearance are out
+        if (/\b(ITAR|U\.?S\.? persons?\b|export control|security clearance|must be (a )?U\.?S\.? citizen|U\.?S\.? citizenship (is )?required)/i.test(j.text ?? "")) { stats.us_person_only = (stats.us_person_only ?? 0) + 1; continue; }
         let keys;
         try { keys = jobKeys(j.url); } catch { continue; }
         const company = prettyCompany(String(j.company).trim());
+        if (isExcludedCompany(company) || isExcludedCompany(t)) { stats.tracker_excluded = (stats.tracker_excluded ?? 0) + 1; continue; }
         const sk = softKey(company, j.title);
         if (known.dedupe.has(keys.dedupe_key) || known.soft.has(sk)) { stats.duplicates++; continue; }
         known.dedupe.add(keys.dedupe_key);
