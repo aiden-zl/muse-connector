@@ -174,6 +174,13 @@ const commands = {
     console.log(JSON.stringify(await api("POST", "/admin/answer-bank", { entries: JSON.parse(readFileSync(file, "utf8")) })));
   },
 
+  async "upload-file"(file, name) {
+    if (!file) die("usage: upload-file <file.pdf> [public-name.pdf]  → prints an unguessable URL");
+    const n = name ?? file.split("/").pop();
+    const type = n.toLowerCase().endsWith(".docx") ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document" : "application/pdf";
+    console.log(JSON.stringify(await api("POST", "/admin/files", { name: n, type, data_b64: readFileSync(file).toString("base64") })));
+  },
+
   async "essay-add"(company, prompt, file) {
     if (!company || !prompt || !file) die('usage: essay-add "<company>" "<prompt>" <essay.txt>');
     console.log(JSON.stringify(await api("POST", "/admin/essays", { company, prompt, text: readFileSync(file, "utf8").trim() })));
@@ -246,7 +253,7 @@ const commands = {
   push-jobs <file.csv|json> | job-keys
   answer <qid> <text|@file> [--no-bank] [--keywords a,b]
   resolve <job_id> <pending|skipped|submitted|needs_human> [reason]
-  profile-set <file.json> | bank-add <file.json> | essay-add "<company>" "<prompt>" <file>
+  profile-set <file.json> | bank-add <file.json> | upload-file <file.pdf> [name] | essay-add "<company>" "<prompt>" <file>
   pause | resume | config key=value... | unlock | revoke-grants
   export [out.csv] | sync-keychain`);
   },

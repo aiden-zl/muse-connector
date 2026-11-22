@@ -1,6 +1,6 @@
 // Guardian-only REST API. Bearer ADMIN_TOKEN in the Authorization header. No CORS: browsers never call this.
 import type { Env } from "./env";
-import { ctEqual } from "./crypto";
+import { ctEqual, randomToken } from "./crypto";
 import { bump } from "./auth";
 import { jobKeys, normCompany, normText, softKey } from "./keys";
 import { forbiddenPii, JOB_SPECIFIC_KINDS } from "./text";
@@ -246,6 +246,21 @@ export async function handleAdmin(req: Request, env: Env): Promise<Response> {
     await db.batch(stmts);
     await logEvent(db, "guardian", "answered", q.job_id, { question_id: id, kind: q.kind });
     return json({ ok: true, id });
+  }
+
+  // ---- hosted files (resume). Public URL is unguessable: /f/<token>/<name>
+  if (path === "/admin/files" && m === "POST") {
+    const b = await body();
+    const name = String(b.name ?? "").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120);
+    const type = String(b.type ?? "application/pdf");
+    if (!name || typeof b.data_b64 !== "string") return json({ error: "name, data_b64 required" }, 400);
+    if (!/^(application\/pdf|application\/vnd\.openxmlformats-officedocument\.wordprocessingml\.document)$/.test(type)) return json({ error: "pdf or docx only" }, 400);
+    const bytes = Uint8Array.from(atob(b.data_b64), (c) => c.charCodeAt(0));
+    if (bytes.length > 5_000_000) return json({ error: "too large" }, 400);
+    const token = randomToken(32);
+    await env.OAUTH_KV.put(`file:${token}`, bytes, { metadata: { type, name } });
+    if (b.replace_token && /^[A-Za-z0-9_-]{32,64}$/.test(String(b.replace_token))) await env.OAUTH_KV.delete(`file:${b.replace_token}`);
+    return json({ ok: true, url: `${url.origin}/f/${token}/${name}` });
   }
 
   // ---- essays / profile / answer bank

@@ -14,6 +14,20 @@ const defaultHandler = {
     const path = new URL(req.url).pathname;
     if (path === "/authorize") return handleAuthorize(req, env);
     if (path.startsWith("/admin/") || path === "/admin") return handleAdmin(req, env);
+    const fm = path.match(/^\/f\/([A-Za-z0-9_-]{32,64})\/[^/]{1,120}$/);
+    if (fm && (req.method === "GET" || req.method === "HEAD")) {
+      const { value, metadata } = await env.OAUTH_KV.getWithMetadata<{ type?: string; name?: string }>(`file:${fm[1]}`, "arrayBuffer");
+      if (!value) return new Response("Not found", { status: 404 });
+      return new Response(req.method === "HEAD" ? null : value, {
+        headers: {
+          "Content-Type": metadata?.type ?? "application/octet-stream",
+          "Content-Disposition": `inline; filename="${(metadata?.name ?? "file").replace(/[^A-Za-z0-9._-]/g, "_")}"`,
+          "Cache-Control": "no-store",
+          "X-Robots-Tag": "noindex, nofollow",
+          "X-Content-Type-Options": "nosniff",
+        },
+      });
+    }
     if (path === "/health") return new Response("ok", { headers: { "Cache-Control": "no-store" } });
     if (path === "/") return new Response("Muse bridge. Add <origin>/mcp as a custom connector in Muse.", { headers: { "Content-Type": "text/plain" } });
     return new Response("Not found", { status: 404 });
